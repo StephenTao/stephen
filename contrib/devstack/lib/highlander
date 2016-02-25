@@ -1,0 +1,189 @@
+# lib/highlander
+
+# Dependencies:
+# ``functions`` file
+# ``DEST``, ``DATA_DIR``, ``STACK_USER`` must be defined
+
+# ``stack.sh`` calls the entry points in this order:
+#
+# install_highlander
+# configure_highlander
+# start_highlander
+# stop_highlander
+
+
+# Save trace setting
+XTRACE=$(set +o | grep xtrace)
+set -o xtrace
+
+
+# Defaults
+# --------
+
+# Set up default repos
+
+highlander_REPO=${highlander_REPO:-https://{GIT_USERNAME}:{GIT_PASSWORD}@github.com/stratustech/highlander.git}
+highlander_BRANCH=${highlander_BRANCH:-master}
+
+highlander_PYTHONCLIENT_REPO=${highlander_PYTHONCLIENT_REPO:-https://{GIT_USERNAME}:{GIT_PASSWORD}@github.com/stratustech/python-highlanderclient.git}
+highlander_PYTHONCLIENT_BRANCH=${highlander_PYTHONCLIENT_BRANCH:-$highlander_BRANCH}
+highlander_PYTHONCLIENT_DIR=$DEST/python-highlanderclient
+
+# Set up default directories
+highlander_DIR=$DEST/highlander
+highlander_CONF_DIR=${highlander_CONF_DIR:-/etc/highlander}
+highlander_CONF_FILE=${highlander_CONF_DIR}/highlander.conf
+highlander_DEBUG=${highlander_DEBUG:-True}
+
+highlander_SERVICE_HOST=${highlander_SERVICE_HOST:-$SERVICE_HOST}
+highlander_SERVICE_PORT=${highlander_SERVICE_PORT:-8989}
+highlander_SERVICE_PROTOCOL=${highlander_SERVICE_PROTOCOL:-$SERVICE_PROTOCOL}
+
+highlander_ADMIN_USER=${highlander_ADMIN_USER:-highlander}
+
+# Support entry points installation of console scripts
+if [[ -d $highlander_DIR/bin ]]; then
+    highlander_BIN_DIR=$highlander_DIR/bin
+else
+    highlander_BIN_DIR=$(get_python_exec_prefix)
+fi
+
+# create_highlander_accounts - Set up common required highlander accounts
+#
+# Tenant      User       Roles
+# ------------------------------
+# service     highlander     admin
+function create_highlander_accounts {
+    if ! is_service_enabled key; then
+        return
+    fi
+
+    SERVICE_TENANT=$(openstack project list | awk "/ $SERVICE_TENANT_NAME / { print \$2 }")
+    ADMIN_ROLE=$(openstack role list | awk "/ admin / { print \$2 }")
+
+    highlander_USER=$(openstack user create \
+        $highlander_ADMIN_USER \
+        --password "$SERVICE_PASSWORD" \
+        --project $SERVICE_TENANT \
+        --email highlander@example.com \
+        | grep " id " | get_field 2)
+
+    openstack role add \
+        $ADMIN_ROLE \
+        --project $SERVICE_TENANT \
+        --user $highlander_USER
+
+    if [[ "$KEYSTONE_CATALOG_BACKEND" = 'sql' ]]; then
+        highlander_SERVICE_V1=$(openstack service create \
+             highlander \
+            --type=highlander \
+            --description="Highlander Stratus Cloud Service v1" \
+            | grep " id " | get_field 2)
+
+        openstack endpoint create \
+            $highlander_SERVICE_V1 \
+            --region RegionOne \
+            --publicurl "$highlander_SERVICE_PROTOCOL://$highlander_SERVICE_HOST:$highlander_SERVICE_PORT/v1" \
+            --adminurl "$highlander_SERVICE_PROTOCOL://$highlander_SERVICE_HOST:$highlander_SERVICE_PORT/v1" \
+            --internalurl "$highlander_SERVICE_PROTOCOL://$highlander_SERVICE_HOST:$highlander_SERVICE_PORT/v1"
+
+    fi
+}
+
+
+function mkdir_chown_stack {
+    if [[ ! -d "$1" ]]; then
+        sudo mkdir -p "$1"
+    fi
+    sudo chown $STACK_USER "$1"
+}
+
+# Entry points
+# ------------
+
+# configure_highlander - Set config files, create data dirs, etc
+function configure_highlander {
+    mkdir_chown_stack "$highlander_CONF_DIR"
+
+    # Copy over highlander configuration file and configure common parameters.
+    cp $highlander_DIR/etc/highlander.conf.sample $highlander_CONF_FILE
+    iniset $highlander_CONF_FILE DEFAULT debug $highlander_DEBUG
+
+    # Run all highlander processes as a single process
+    iniset $highlander_CONF_FILE DEFAULT server all
+    iniset $highlander_CONF_FILE DEFAULT rpc_backend fake
+
+    # highlander Configuration
+    #-------------------------
+
+    # Setup keystone_authtoken section
+    iniset $highlander_CONF_FILE keystone_authtoken auth_host $KEYSTONE_AUTH_HOST
+    iniset $highlander_CONF_FILE keystone_authtoken auth_port $KEYSTONE_AUTH_PORT
+    iniset $highlander_CONF_FILE keystone_authtoken auth_protocol $KEYSTONE_AUTH_PROTOCOL
+    iniset $highlander_CONF_FILE keystone_authtoken admin_tenant_name $SERVICE_TENANT_NAME
+    iniset $highlander_CONF_FILE keystone_authtoken admin_user $highlander_ADMIN_USER
+    iniset $highlander_CONF_FILE keystone_authtoken admin_password $SERVICE_PASSWORD
+
+    # Setup RabbitMQ credentials
+    iniset $highlander_CONF_FILE DEFAULT rabbit_password $RABBIT_PASSWORD
+
+    # Configure the database.
+    iniset $highlander_CONF_FILE database connection `database_connection_url highlander`
+    iniset $highlander_CONF_FILE database max_overflow -1
+    iniset $highlander_CONF_FILE database max_pool_size 1000
+
+    # Configure keystone auth url
+    iniset $highlander_CONF_FILE keystone_authtoken auth_uri "http://${KEYSTONE_AUTH_HOST}:5000/v3"
+}
+
+
+# init_highlander - Initialize the database
+function init_highlander {
+    # (re)create highlander database
+    recreate_database highlander utf8
+    python $highlander_DIR/tools/sync_db.py --config-file $highlander_CONF_FILE
+}
+
+
+# install_highlander - Collect source and prepare
+function install_highlander {
+    install_highlander_pythonclient
+
+    git_clone $highlander_REPO $highlander_DIR $highlander_BRANCH
+
+    # setup_package function is used because highlander requirements
+    # don't match with global-requirement.txt
+    # both functions (setup_develop and setup_package) are defined at:
+    # http://git.openstack.org/cgit/openstack-dev/devstack/tree/functions-common
+    setup_package $highlander_DIR -e
+    
+    # installing python-nose.
+    real_install_package python-nose
+}
+
+function install_highlander_pythonclient {
+    git_clone $highlander_PYTHONCLIENT_REPO $highlander_PYTHONCLIENT_DIR $highlander_PYTHONCLIENT_BRANCH
+   #git --git-dir=$highlander_PYTHONCLIENT_DIR/.git tag -d 2015.1.0b1 2015.1.0b2 2015.1.0b3 2015.1.0rc1 2015.1.0
+    setup_package $highlander_PYTHONCLIENT_DIR -e
+}
+
+
+# start_highlander - Start running processes, including screen
+function start_highlander {
+    screen_it highlander "cd $highlander_DIR && $highlander_BIN_DIR/highlander-server --config-file $highlander_CONF_DIR/highlander.conf"
+}
+
+
+# stop_highlander - Stop running processes
+function stop_highlander {
+    # Kill the highlander screen windows
+    screen -S $SCREEN_NAME -p highlander -X kill
+}
+
+
+# Restore xtrace
+$XTRACE
+
+# Local variables:
+# mode: shell-script
+# End:
